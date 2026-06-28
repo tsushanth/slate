@@ -1,0 +1,7 @@
+/target
+slate.db
+slate.db-shm
+slate.db-wal
+bench/results-*.md
+*.pem
+.env

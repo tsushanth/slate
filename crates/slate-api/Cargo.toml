@@ -1,0 +1,23 @@
+[package]
+name = "slate-api"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "slate-api"
+path = "src/main.rs"
+
+[dependencies]
+slate-core = { path = "../slate-core" }
+slate-store = { path = "../slate-store" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+axum = { version = "0.7", features = ["macros"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+futures = { workspace = true }

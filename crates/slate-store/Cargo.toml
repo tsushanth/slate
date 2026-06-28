@@ -1,0 +1,15 @@
+[package]
+name = "slate-store"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+slate-core = { path = "../slate-core" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "uuid", "chrono"] }
