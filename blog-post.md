@@ -70,17 +70,19 @@ Sweet spot: 8 concurrent objects, each split into 16 × 8 MiB range-GETs = 128 c
 
 | Tool | Avg time | Throughput | vs slate |
 |---|---|---|---|
-| **slate** | 4.1s | **642 MB/s** | — |
-| `aws s3 cp --recursive` | 12.0s | 220 MB/s | **2.9× slower** |
-| `rclone --transfers 8` | 2.3s | 1,148 MB/s | 1.8× faster |
+| **slate** | 4.4s | **598 MB/s** | — |
+| `aws s3 cp --recursive` | 12.0s | 220 MB/s | **2.7× slower** |
+| `rclone --transfers 32` | 2.9s | 905 MB/s | 1.5× faster |
 
 ### What the numbers mean
 
-**Slate vs `aws s3 cp`:** 2.9× faster. The AWS CLI uses a single-stream transfer manager with limited parallelism by default. Slate fires 128 concurrent range-GETs and saturates the pipe.
+**Slate vs `aws s3 cp`:** 2.7× faster. The AWS CLI uses a single-stream transfer manager with limited parallelism by default. Slate fires 128 concurrent range-GETs and saturates the pipe.
 
-**Slate vs rclone:** rclone wins here at 1.8× faster. rclone uses 8 full-file parallel downloads (~140 MB/s each), which is the right strategy for cross-region S3 where S3 caps bandwidth per connection. Our chunked approach adds per-request overhead that partially cancels out the parallelism gain at cross-region latencies. Same-region, chunking dominates — we'll publish those numbers next.
+**Slate vs rclone:** rclone wins here at 1.5× faster. rclone is a mature tool with years of S3-specific transfer optimization. We're not going to pretend otherwise.
 
-**The honest headline:** slate beats `aws s3 cp` by 2.9× with zero configuration. That's the tool most ML engineers are actually using today.
+What slate offers that rclone doesn't: a REST API with real-time SSE progress streaming, persistent SQLite job history, and a unified multi-cloud abstraction in a single binary — with no config file for the common cases.
+
+**The honest headline:** slate beats `aws s3 cp` by 2.7× with zero configuration. That's the tool most ML engineers are actually using today.
 
 ---
 
