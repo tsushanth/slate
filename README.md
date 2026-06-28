@@ -7,12 +7,12 @@ Move datasets, model weights, and checkpoints between object stores at high thro
 ```
 Benchmarked: S3 us-east-1 → Hetzner Frankfurt · 5 × 529 MiB model weights
 
-  slate            598 MB/s   ████████████████████
-  aws s3 cp        220 MB/s   ███████              2.7× slower
-  rclone           905 MB/s   ██████████████████████████████
+  slate            984 MB/s   ████████████████████████████████
+  aws s3 cp        221 MB/s   ███████                          4.4× slower
+  rclone          1120 MB/s   ████████████████████████████████████
 ```
 
-Slate beats `aws s3 cp` (the tool most ML teams actually use) by **2.7×** with zero configuration. rclone is faster — it's a mature tool with years of S3 tuning behind it. Slate's advantage is the API server, job tracking, and unified multi-cloud support in a single binary. Full benchmark methodology in [bench/](bench/).
+Slate beats `aws s3 cp` by **4.4×** out of the box with zero configuration. rclone edges ahead at 1.14× — it's a mature tool. Slate's differentiation is the REST API, persistent job tracking, and unified multi-cloud support in a single binary. Full benchmark methodology in [bench/](bench/).
 
 ---
 
@@ -107,10 +107,10 @@ slate copy s3://source gs://dest
 
 | Variable | Default | What it controls |
 |---|---|---|
-| `SLATE_PARALLEL_OBJECTS` | 8 | Objects transferred concurrently |
-| `SLATE_PARALLEL_CHUNKS` | 16 | Range-GETs per object in parallel |
-| `SLATE_CHUNK_SIZE_MIB` | 8 | Size of each chunk |
-| `SLATE_STRATEGY` | `chunked` | `chunked` (parallel range-GETs, default) or `stream` (full-object streams, rclone-style) |
+| `SLATE_PARALLEL_OBJECTS` | 16 | Objects transferred concurrently |
+| `SLATE_PARALLEL_CHUNKS` | 4 | Range-GETs per object in parallel |
+| `SLATE_CHUNK_SIZE_MIB` | 64 | Size of each chunk (larger = fewer requests = less RTT overhead) |
+| `SLATE_STRATEGY` | `chunked` | `chunked` (seekable parallel range-GETs, default) or `stream` (full-object streaming) |
 
 HTTP/2 is negotiated where available (S3, GCS), with a 32-connection pool and keepalive to reduce per-request overhead.
 
