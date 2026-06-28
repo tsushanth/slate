@@ -14,7 +14,7 @@ const DEFAULT_PARALLEL_CHUNKS: usize = 8;
 const DEFAULT_PARALLEL_OBJECTS: usize = 8;
 
 fn chunk_size() -> usize {
-    std::env::var("SLATE_chunk_size()_MIB")
+    std::env::var("SLATE_CHUNK_SIZE_MIB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .map(|mib| mib * 1024 * 1024)
@@ -22,14 +22,14 @@ fn chunk_size() -> usize {
 }
 
 fn parallel_chunks() -> usize {
-    std::env::var("SLATE_parallel_chunks()")
+    std::env::var("SLATE_PARALLEL_CHUNKS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PARALLEL_CHUNKS)
 }
 
 fn parallel_objects() -> usize {
-    std::env::var("SLATE_parallel_objects()")
+    std::env::var("SLATE_PARALLEL_OBJECTS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_PARALLEL_OBJECTS)
