@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "prefect-slate"
+version = "0.2.0"
+description = "Prefect tasks for Slate — high-throughput multi-cloud data transfers"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+dependencies = [
+    "prefect>=2.14",
+    "slate-sdk>=0.2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/tsushanth/slate"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["prefect_slate*"]

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "apache-airflow-providers-slate"
+version = "0.2.0"
+description = "Apache Airflow provider for Slate — high-throughput multi-cloud data transfers"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+dependencies = [
+    "apache-airflow>=2.6",
+    "slate-sdk>=0.2.0",
+]
+
+[project.entry-points."apache_airflow_provider"]
+slate = "apache_airflow_providers_slate"
+
+[project.urls]
+Homepage = "https://github.com/tsushanth/slate"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["apache_airflow_providers_slate*"]
