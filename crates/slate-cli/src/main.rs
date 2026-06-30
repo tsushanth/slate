@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
-use slate_core::{job::JobStatus, progress::ProgressEvent, transfer::TransferEngine};
+use slate_core::{cost, job::CreateJobRequest, progress::ProgressEvent, transfer::TransferEngine};
 use slate_store::JobStore;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -55,7 +55,15 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let job = slate_core::job::Job::new(src.clone(), dst.clone());
+            let job = slate_core::job::Job::new(CreateJobRequest {
+                src: src.clone(),
+                dst: dst.clone(),
+                priority: None,
+                max_attempts: Some(1), // CLI runs are one-shot; retries are an API-layer concern
+                run_after: None,
+                depends_on: None,
+                callback_url: None,
+            });
             store.create(&job).await?;
             println!("Job {} queued", job.id);
 
@@ -88,19 +96,19 @@ async fn main() -> Result<()> {
                     bar.finish_with_message("done");
                     let elapsed = start.elapsed().as_secs_f64();
                     let throughput = (bytes as f64 / elapsed) / 1_000_000.0;
-                    store.set_status(job_id, JobStatus::Completed, None).await?;
+                    store.set_completed(job_id, Some(throughput)).await?;
+                    let egress = cost::estimate(&src, bytes);
                     println!(
-                        "\nTransferred {} in {:.1}s  ({:.1} MB/s)",
+                        "\nTransferred {} in {:.1}s  ({:.1} MB/s)  ~${:.4} egress",
                         human_bytes(bytes),
                         elapsed,
-                        throughput
+                        throughput,
+                        egress.estimated_usd,
                     );
                 }
                 Err(e) => {
                     bar.abandon();
-                    store
-                        .set_status(job_id, JobStatus::Failed, Some(e.to_string()))
-                        .await?;
+                    store.set_failed(job_id, &e.to_string()).await?;
                     eprintln!("Transfer failed: {e}");
                     std::process::exit(1);
                 }
@@ -136,19 +144,28 @@ async fn main() -> Result<()> {
 
         Commands::Status { id } => match store.get(id).await? {
             Some(job) => {
-                println!("ID:          {}", job.id);
-                println!("Status:      {:?}", job.status);
-                println!("Source:      {}", job.src);
-                println!("Destination: {}", job.dst);
-                println!("Transferred: {}", human_bytes(job.bytes_transferred));
+                println!("ID:           {}", job.id);
+                println!("Status:       {:?}", job.status);
+                println!("Source:       {}", job.src);
+                println!("Destination:  {}", job.dst);
+                println!("Attempt:      {}/{}", job.attempt, job.max_attempts);
+                println!("Transferred:  {}", human_bytes(job.bytes_transferred));
                 if let Some(total) = job.bytes_total {
-                    println!("Total:       {}", human_bytes(total));
+                    println!("Total:        {}", human_bytes(total));
+                }
+                if let Some(mbps) = job.peak_throughput_mbps {
+                    println!("Peak speed:   {:.1} MB/s", mbps);
+                }
+                if job.bytes_transferred > 0 {
+                    let e = cost::estimate(&job.src, job.bytes_transferred);
+                    println!("Egress cost:  ~${:.4} ({})", e.estimated_usd, e.provider);
                 }
                 if let Some(err) = &job.error {
-                    println!("Error:       {}", err);
+                    println!("Error:        {}", err);
                 }
-                println!("Created:     {}", job.created_at);
-                println!("Updated:     {}", job.updated_at);
+                if let Some(t) = job.started_at   { println!("Started:      {t}"); }
+                if let Some(t) = job.completed_at { println!("Completed:    {t}"); }
+                println!("Created:      {}", job.created_at);
             }
             None => {
                 eprintln!("Job {id} not found");
@@ -172,36 +189,11 @@ fn human_bytes(b: u64) -> String {
     }
 }
 
-fn print_egress_estimate(src: &str, dst: &str) {
-    let src_provider = detect_provider(src);
-    let dst_provider = detect_provider(dst);
-    let rate = egress_rate(src_provider);
-
+fn print_egress_estimate(src: &str, _dst: &str) {
+    let e = cost::estimate(src, 0);
     println!("Egress cost estimate:");
-    println!("  Source:      {src_provider}");
-    println!("  Destination: {dst_provider}");
-    println!("  Rate:        ${rate:.4}/GB (approximate list price)");
+    println!("  Source:  {}", e.provider);
+    println!("  Rate:    ${:.4}/GB (approximate list price)", e.rate_per_gb);
     println!();
-    println!("Run without --estimate to execute the transfer.");
-}
-
-fn detect_provider(url: &str) -> &'static str {
-    if url.starts_with("s3://") {
-        "AWS S3"
-    } else if url.starts_with("gs://") {
-        "Google Cloud Storage"
-    } else if url.starts_with("az://") {
-        "Azure Blob Storage"
-    } else {
-        "Local / Unknown"
-    }
-}
-
-fn egress_rate(src: &str) -> f64 {
-    match src {
-        "AWS S3" => 0.09,
-        "Google Cloud Storage" => 0.12,
-        "Azure Blob Storage" => 0.087,
-        _ => 0.0,
-    }
+    println!("Run without --estimate to execute the transfer and see the actual cost.");
 }

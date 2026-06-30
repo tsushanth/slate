@@ -1,3 +1,5 @@
+mod worker;
+
 use anyhow::Result;
 use axum::{
     extract::{Path, State},
@@ -8,14 +10,15 @@ use axum::{
     Router,
 };
 use futures::stream;
+use serde_json::json;
 use slate_core::{
-    job::{CreateJobRequest, Job, JobStatus},
+    cost,
+    job::{CreateJobRequest, Job},
     progress::ProgressEvent,
-    transfer::TransferEngine,
 };
 use slate_store::JobStore;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tracing::info;
 use uuid::Uuid;
 
@@ -40,13 +43,26 @@ async fn main() -> Result<()> {
     let store = Arc::new(JobStore::new(&db_url).await?);
     let (progress_tx, _) = broadcast::channel::<ProgressEvent>(1024);
 
+    let concurrency: usize = std::env::var("SLATE_WORKER_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+
+    worker::start(store.clone(), progress_tx.clone(), concurrency);
+    info!("worker started (concurrency={concurrency})");
+
     let state = AppState { store, progress_tx };
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        // Jobs
         .route("/jobs", post(create_job).get(list_jobs))
         .route("/jobs/:id", get(get_job))
+        .route("/jobs/:id/cancel", post(cancel_job))
         .route("/jobs/:id/events", get(job_events))
+        // Cost
+        .route("/cost", get(cost_summary))
+        .route("/jobs/:id/cost", get(job_cost))
         .with_state(state)
         .layer(tower_http::cors::CorsLayer::permissive())
         .layer(tower_http::trace::TraceLayer::new_for_http());
@@ -66,58 +82,45 @@ async fn create_job(
     State(state): State<AppState>,
     Json(req): Json<CreateJobRequest>,
 ) -> Result<(StatusCode, Json<Job>), AppError> {
-    let job = Job::new(req.src.clone(), req.dst.clone());
-    state.store.create(&job).await?;
-
-    let job_id = job.id;
-    let store = state.store.clone();
-    let progress_tx = state.progress_tx.clone();
-    let src = req.src.clone();
-    let dst = req.dst.clone();
-
-    tokio::spawn(async move {
-        let (tx, mut rx) = mpsc::channel::<ProgressEvent>(64);
-
-        let progress_store = store.clone();
-        let bcast = progress_tx.clone();
-        tokio::spawn(async move {
-            while let Some(ev) = rx.recv().await {
-                let _ = progress_store
-                    .update_progress(ev.job_id, ev.bytes_transferred, ev.bytes_total)
-                    .await;
-                let _ = bcast.send(ev);
-            }
-        });
-
-        match TransferEngine::run(job_id, &src, &dst, tx).await {
-            Ok(bytes) => {
-                let _ = store.set_status(job_id, JobStatus::Completed, None).await;
-                info!(job_id = %job_id, bytes, "job completed");
-            }
-            Err(e) => {
-                let _ = store
-                    .set_status(job_id, JobStatus::Failed, Some(e.to_string()))
-                    .await;
-            }
+    // Validate dependency exists
+    if let Some(dep_id) = req.depends_on {
+        if state.store.get(dep_id).await?.is_none() {
+            return Err(AppError::BadRequest(format!(
+                "depends_on job {dep_id} does not exist"
+            )));
         }
-    });
+    }
 
-    let job = state.store.get(job_id).await?.ok_or(AppError::NotFound)?;
+    let job = Job::new(req);
+    state.store.create(&job).await?;
+    info!(job_id = %job.id, src = %job.src, dst = %job.dst, "job queued");
+
+    let job = state.store.get(job.id).await?.ok_or(AppError::NotFound)?;
     Ok((StatusCode::CREATED, Json(job)))
 }
 
 async fn list_jobs(State(state): State<AppState>) -> Result<Json<Vec<Job>>, AppError> {
-    let jobs = state.store.list().await?;
-    Ok(Json(jobs))
+    Ok(Json(state.store.list().await?))
 }
 
 async fn get_job(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Job>, AppError> {
-    match state.store.get(id).await? {
-        Some(job) => Ok(Json(job)),
-        None => Err(AppError::NotFound),
+    state.store.get(id).await?.map(Json).ok_or(AppError::NotFound)
+}
+
+async fn cancel_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cancelled = state.store.cancel(id).await?;
+    if cancelled {
+        Ok(Json(json!({"cancelled": true, "job_id": id})))
+    } else {
+        Err(AppError::BadRequest(
+            "job not found or is already running/completed".into(),
+        ))
     }
 }
 
@@ -141,9 +144,67 @@ async fn job_events(
     Sse::new(s).keep_alive(KeepAlive::default())
 }
 
+async fn job_cost(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let job = state.store.get(id).await?.ok_or(AppError::NotFound)?;
+    let bytes = job.bytes_transferred;
+    let estimate = cost::estimate(&job.src, bytes);
+    Ok(Json(json!({
+        "job_id": id,
+        "src": job.src,
+        "bytes_transferred": bytes,
+        "provider": estimate.provider,
+        "rate_per_gb_usd": estimate.rate_per_gb,
+        "estimated_egress_usd": (estimate.estimated_usd * 10000.0).round() / 10000.0,
+    })))
+}
+
+async fn cost_summary(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let rows = state.store.cost_summary().await?;
+    let breakdown: Vec<_> = rows
+        .iter()
+        .map(|(provider, bytes)| {
+            let rate = match provider.as_str() {
+                "aws" => 0.09,
+                "gcp" => 0.12,
+                "azure" => 0.087,
+                _ => 0.0,
+            };
+            let gb = *bytes as f64 / 1_073_741_824.0;
+            json!({
+                "provider": provider,
+                "bytes_transferred": bytes,
+                "gb_transferred": (gb * 100.0).round() / 100.0,
+                "rate_per_gb_usd": rate,
+                "estimated_egress_usd": (gb * rate * 10000.0).round() / 10000.0,
+            })
+        })
+        .collect();
+
+    let total_usd: f64 = rows.iter().map(|(provider, bytes)| {
+        let rate = match provider.as_str() {
+            "aws" => 0.09,
+            "gcp" => 0.12,
+            "azure" => 0.087,
+            _ => 0.0,
+        };
+        (*bytes as f64 / 1_073_741_824.0) * rate
+    }).sum();
+
+    Ok(Json(json!({
+        "breakdown": breakdown,
+        "total_estimated_egress_usd": (total_usd * 10000.0).round() / 10000.0,
+    })))
+}
+
 #[derive(Debug)]
 enum AppError {
     NotFound,
+    BadRequest(String),
     Internal(anyhow::Error),
 }
 
@@ -157,6 +218,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         match self {
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
+            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             AppError::Internal(e) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
             }
