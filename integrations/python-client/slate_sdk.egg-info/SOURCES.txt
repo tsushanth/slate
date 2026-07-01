@@ -1,0 +1,8 @@
+pyproject.toml
+slate_sdk/__init__.py
+slate_sdk/client.py
+slate_sdk.egg-info/PKG-INFO
+slate_sdk.egg-info/SOURCES.txt
+slate_sdk.egg-info/dependency_links.txt
+slate_sdk.egg-info/requires.txt
+slate_sdk.egg-info/top_level.txt

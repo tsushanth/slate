@@ -63,6 +63,7 @@ async fn main() -> Result<()> {
                 run_after: None,
                 depends_on: None,
                 callback_url: None,
+                cron: None,
             });
             store.create(&job).await?;
             println!("Job {} queued", job.id);

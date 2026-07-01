@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+apache_airflow_providers_slate/__init__.py
+apache_airflow_providers_slate.egg-info/PKG-INFO
+apache_airflow_providers_slate.egg-info/SOURCES.txt
+apache_airflow_providers_slate.egg-info/dependency_links.txt
+apache_airflow_providers_slate.egg-info/entry_points.txt
+apache_airflow_providers_slate.egg-info/requires.txt
+apache_airflow_providers_slate.egg-info/top_level.txt
+apache_airflow_providers_slate/hooks/__init__.py
+apache_airflow_providers_slate/hooks/slate.py
+apache_airflow_providers_slate/operators/__init__.py
+apache_airflow_providers_slate/operators/slate.py

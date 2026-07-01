@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use slate_core::job::{Job, JobStatus};
+use slate_core::job::{CronJob, CreateCronRequest, Job, JobStatus};
 use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 use uuid::Uuid;
 
@@ -14,6 +14,26 @@ impl JobStore {
             .max_connections(10)
             .connect(database_url)
             .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS cron_jobs (
+                id           TEXT PRIMARY KEY,
+                src          TEXT NOT NULL,
+                dst          TEXT NOT NULL,
+                cron         TEXT NOT NULL,
+                priority     INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                callback_url TEXT,
+                next_run_at  TEXT NOT NULL,
+                last_job_id  TEXT,
+                created_at   TEXT NOT NULL,
+                enabled      INTEGER NOT NULL DEFAULT 1
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await?;
 
         sqlx::query(
             r#"
@@ -324,5 +344,112 @@ fn parse_status(s: &str) -> JobStatus {
         "failed" => JobStatus::Failed,
         "cancelled" => JobStatus::Cancelled,
         _ => JobStatus::Queued,
+    }
+}
+
+// ── Cron job store methods ────────────────────────────────────────────────────
+
+impl JobStore {
+    pub async fn create_cron(&self, req: &CreateCronRequest, next_run_at: DateTime<Utc>) -> Result<CronJob> {
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        sqlx::query(
+            r#"INSERT INTO cron_jobs (id, src, dst, cron, priority, max_attempts, callback_url, next_run_at, created_at, enabled)
+               VALUES (?,?,?,?,?,?,?,?,?,1)"#,
+        )
+        .bind(id.to_string())
+        .bind(&req.src)
+        .bind(&req.dst)
+        .bind(&req.cron)
+        .bind(req.priority.unwrap_or(0))
+        .bind(req.max_attempts.unwrap_or(3) as i64)
+        .bind(&req.callback_url)
+        .bind(next_run_at.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(CronJob {
+            id,
+            src: req.src.clone(),
+            dst: req.dst.clone(),
+            cron: req.cron.clone(),
+            priority: req.priority.unwrap_or(0),
+            max_attempts: req.max_attempts.unwrap_or(3),
+            callback_url: req.callback_url.clone(),
+            next_run_at,
+            last_job_id: None,
+            created_at: now,
+            enabled: true,
+        })
+    }
+
+    pub async fn list_crons(&self) -> Result<Vec<CronJob>> {
+        let rows = sqlx::query(
+            "SELECT id, src, dst, cron, priority, max_attempts, callback_url, next_run_at, last_job_id, created_at, enabled FROM cron_jobs ORDER BY created_at DESC"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_cron).collect())
+    }
+
+    pub async fn get_cron(&self, id: Uuid) -> Result<Option<CronJob>> {
+        let row = sqlx::query(
+            "SELECT id, src, dst, cron, priority, max_attempts, callback_url, next_run_at, last_job_id, created_at, enabled FROM cron_jobs WHERE id=?"
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.as_ref().map(row_to_cron))
+    }
+
+    pub async fn delete_cron(&self, id: Uuid) -> Result<bool> {
+        let r = sqlx::query("DELETE FROM cron_jobs WHERE id=?")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Return all enabled cron jobs whose next_run_at is in the past.
+    pub async fn due_crons(&self) -> Result<Vec<CronJob>> {
+        let now = Utc::now().to_rfc3339();
+        let rows = sqlx::query(
+            "SELECT id, src, dst, cron, priority, max_attempts, callback_url, next_run_at, last_job_id, created_at, enabled FROM cron_jobs WHERE enabled=1 AND next_run_at <= ?"
+        )
+        .bind(&now)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_cron).collect())
+    }
+
+    /// After spawning a job for a cron entry, advance next_run_at to the next tick.
+    pub async fn advance_cron(&self, id: Uuid, last_job_id: Uuid, next_run_at: DateTime<Utc>) -> Result<()> {
+        sqlx::query(
+            "UPDATE cron_jobs SET last_job_id=?, next_run_at=? WHERE id=?"
+        )
+        .bind(last_job_id.to_string())
+        .bind(next_run_at.to_rfc3339())
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
+fn row_to_cron(r: &sqlx::sqlite::SqliteRow) -> CronJob {
+    CronJob {
+        id: Uuid::parse_str(r.get::<&str, _>("id")).unwrap(),
+        src: r.get("src"),
+        dst: r.get("dst"),
+        cron: r.get("cron"),
+        priority: r.get("priority"),
+        max_attempts: r.get::<i64, _>("max_attempts") as u32,
+        callback_url: r.get("callback_url"),
+        next_run_at: r.get::<&str, _>("next_run_at").parse().unwrap(),
+        last_job_id: r.get::<Option<&str>, _>("last_job_id")
+            .and_then(|s| Uuid::parse_str(s).ok()),
+        created_at: r.get::<&str, _>("created_at").parse().unwrap(),
+        enabled: r.get::<i64, _>("enabled") != 0,
     }
 }

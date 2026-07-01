@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "slate-sdk"
@@ -9,7 +9,7 @@ description = "Python client for Slate — high-throughput data orchestrator for
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
-dependencies = ["requests>=2.28", "sseclient-py>=1.7"]
+dependencies = ["requests>=2.28"]
 
 [project.urls]
 Homepage = "https://github.com/tsushanth/slate"

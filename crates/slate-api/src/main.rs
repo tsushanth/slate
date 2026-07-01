@@ -13,13 +13,14 @@ use futures::stream;
 use serde_json::json;
 use slate_core::{
     cost,
-    job::{CreateJobRequest, Job},
+    job::{CreateCronRequest, CreateJobRequest, Job},
     progress::ProgressEvent,
 };
 use slate_store::JobStore;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::info;
+use chrono;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -63,6 +64,9 @@ async fn main() -> Result<()> {
         // Cost
         .route("/cost", get(cost_summary))
         .route("/jobs/:id/cost", get(job_cost))
+        // Cron schedules
+        .route("/crons", post(create_cron).get(list_crons))
+        .route("/crons/:id", get(get_cron).delete(delete_cron))
         .with_state(state)
         .layer(tower_http::cors::CorsLayer::permissive())
         .layer(tower_http::trace::TraceLayer::new_for_http());
@@ -199,6 +203,43 @@ async fn cost_summary(
         "breakdown": breakdown,
         "total_estimated_egress_usd": (total_usd * 10000.0).round() / 10000.0,
     })))
+}
+
+async fn create_cron(
+    State(state): State<AppState>,
+    Json(req): Json<CreateCronRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    let next = worker::next_cron_run(&req.cron, chrono::Utc::now())
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let entry = state.store.create_cron(&req, next).await?;
+    info!(cron_id = %entry.id, cron = %entry.cron, next = %entry.next_run_at, "cron created");
+    Ok((StatusCode::CREATED, Json(serde_json::to_value(&entry).unwrap())))
+}
+
+async fn list_crons(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let crons = state.store.list_crons().await?;
+    Ok(Json(serde_json::to_value(crons).unwrap()))
+}
+
+async fn get_cron(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let entry = state.store.get_cron(id).await?.ok_or(AppError::NotFound)?;
+    Ok(Json(serde_json::to_value(entry).unwrap()))
+}
+
+async fn delete_cron(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if state.store.delete_cron(id).await? {
+        Ok(Json(json!({"deleted": true, "id": id})))
+    } else {
+        Err(AppError::NotFound)
+    }
 }
 
 #[derive(Debug)]

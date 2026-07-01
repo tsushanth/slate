@@ -1,8 +1,24 @@
-use slate_core::{progress::ProgressEvent, transfer::TransferEngine};
+use cron::Schedule;
+use slate_core::{
+    job::{CreateJobRequest, Job},
+    progress::ProgressEvent,
+    transfer::TransferEngine,
+};
 use slate_store::JobStore;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Semaphore};
 use tracing::{error, info};
+
+/// Compute the next UTC datetime after `after` for a cron expression.
+pub fn next_cron_run(expr: &str, after: chrono::DateTime<chrono::Utc>) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+    let schedule = Schedule::from_str(expr)
+        .map_err(|e| anyhow::anyhow!("invalid cron expression '{}': {}", expr, e))?;
+    schedule
+        .after(&after)
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("cron '{}' has no future occurrences", expr))
+}
 
 /// Runs the worker event loop in the background.
 /// Polls for ready jobs every second, executes up to `concurrency` transfers in parallel.
@@ -11,6 +27,9 @@ pub fn start(
     progress_tx: broadcast::Sender<ProgressEvent>,
     concurrency: usize,
 ) {
+    // Job worker loop
+    let store_w = store.clone();
+    let ptx_w = progress_tx.clone();
     tokio::spawn(async move {
         let sem = Arc::new(Semaphore::new(concurrency));
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
@@ -18,26 +37,64 @@ pub fn start(
 
         loop {
             interval.tick().await;
-
-            // Drain all ready jobs up to the concurrency limit
             loop {
                 let Ok(permit) = sem.clone().try_acquire_owned() else { break };
-
-                match store.claim_next().await {
+                match store_w.claim_next().await {
                     Ok(Some(job)) => {
-                        let store = store.clone();
-                        let progress_tx = progress_tx.clone();
+                        let store = store_w.clone();
+                        let progress_tx = ptx_w.clone();
                         tokio::spawn(async move {
-                            let _permit = permit; // drops when task finishes, freeing the slot
+                            let _permit = permit;
                             run_job(store, progress_tx, job).await;
                         });
                     }
-                    Ok(None) => break, // no more ready jobs
-                    Err(e) => {
-                        error!("worker: claim_next error: {e}");
-                        break;
+                    Ok(None) => break,
+                    Err(e) => { error!("worker: claim_next error: {e}"); break; }
+                }
+            }
+        }
+    });
+
+    // Cron scheduler loop — checks every 30 seconds for due cron jobs
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            match store.due_crons().await {
+                Ok(due) => {
+                    for cron_entry in due {
+                        // Spawn a one-shot job for this cron tick
+                        let job = Job::new(CreateJobRequest {
+                            src: cron_entry.src.clone(),
+                            dst: cron_entry.dst.clone(),
+                            priority: Some(cron_entry.priority),
+                            max_attempts: Some(cron_entry.max_attempts),
+                            run_after: None,
+                            depends_on: None,
+                            callback_url: cron_entry.callback_url.clone(),
+                            cron: None,
+                        });
+
+                        if let Err(e) = store.create(&job).await {
+                            error!("cron: failed to create job for {}: {e}", cron_entry.id);
+                            continue;
+                        }
+
+                        // Advance the cron entry to its next tick
+                        match next_cron_run(&cron_entry.cron, chrono::Utc::now()) {
+                            Ok(next) => {
+                                if let Err(e) = store.advance_cron(cron_entry.id, job.id, next).await {
+                                    error!("cron: failed to advance {}: {e}", cron_entry.id);
+                                }
+                                info!(cron_id = %cron_entry.id, job_id = %job.id, next = %next, "cron tick spawned");
+                            }
+                            Err(e) => error!("cron: {e}"),
+                        }
                     }
                 }
+                Err(e) => error!("cron: due_crons error: {e}"),
             }
         }
     });

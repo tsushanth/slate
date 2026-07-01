@@ -1,0 +1,109 @@
+Metadata-Version: 2.4
+Name: prefect-slate
+Version: 0.2.0
+Summary: Prefect tasks for Slate — high-throughput multi-cloud data transfers
+License: Apache-2.0
+Project-URL: Homepage, https://github.com/tsushanth/slate
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: prefect>=2.14
+Requires-Dist: slate-sdk>=0.2.0
+
+# prefect-slate
+
+Prefect tasks for [Slate](https://github.com/tsushanth/slate) — move datasets and model weights between object stores from your Prefect flows at 984 MB/s, 4.4× faster than `aws s3 cp`.
+
+## Install
+
+```bash
+pip install prefect-slate
+```
+
+## Setup
+
+Make sure `slate-api` is running:
+```bash
+DATABASE_URL=sqlite:slate.db?mode=rwc slate-api
+```
+
+## Usage
+
+```python
+from prefect import flow
+from prefect_slate import slate_transfer, SlateCredentials
+
+creds = SlateCredentials(base_url="http://slate-api:3030")
+
+@flow(name="ml-training-pipeline")
+def ml_pipeline():
+    # Ingest raw dataset from S3 to GCS
+    ingest_result = slate_transfer(
+        src="s3://raw-data/datasets/imagenet/",
+        dst="gs://ml-staging/datasets/imagenet/",
+        slate_credentials=creds,
+    )
+    print(f"Ingested {ingest_result['bytes_transferred']} bytes")
+
+    # Copy model weights to GPU node (Prefect waits automatically via return value)
+    weights_result = slate_transfer(
+        src="gs://ml-staging/weights/llama-3-70b/",
+        dst="/mnt/nvme/weights/",
+        slate_credentials=creds,
+        priority=10,
+        max_attempts=5,
+        wait_for=[ingest_result],
+    )
+    print(f"Peak speed: {weights_result['peak_throughput_mbps']:.1f} MB/s")
+
+if __name__ == "__main__":
+    ml_pipeline()
+```
+
+### Server-side pipeline chaining
+
+For transfers that should be chained inside Slate itself (not just Prefect task ordering), use `depends_on_job`:
+
+```python
+@flow
+def pipeline():
+    # Submit both jobs to Slate; Slate worker handles the dependency
+    ingest = slate_transfer(
+        src="s3://raw/",
+        dst="gs://stage/",
+        slate_credentials=creds,
+    )
+    # Slate won't start this until the ingest job_id completes
+    slate_transfer(
+        src="gs://stage/",
+        dst="gs://prod/",
+        slate_credentials=creds,
+        depends_on_job=ingest["job_id"],
+    )
+```
+
+## Supported stores
+
+| URL scheme | Provider |
+|---|---|
+| `s3://bucket/prefix` | AWS S3, MinIO, Cloudflare R2 |
+| `gs://bucket/prefix` | Google Cloud Storage |
+| `az://container/prefix` | Azure Blob Storage |
+| `/path` or `file:///path` | Local filesystem |
+
+## Task reference
+
+```python
+slate_transfer(
+    src="s3://...",                     # required
+    dst="gs://...",                     # required
+    slate_credentials=creds,            # required
+    priority=0,                         # higher = picked up sooner
+    max_attempts=3,                     # retries with exponential backoff
+    depends_on_job=None,                # Slate job ID (server-side chaining)
+    callback_url=None,                  # webhook on complete/fail
+    poll_interval=3.0,                  # seconds between status polls
+    timeout=None,                       # raise after N seconds
+)
+```
+
+Returns a dict with `job_id`, `bytes_transferred`, `peak_throughput_mbps`, `started_at`, `completed_at`.

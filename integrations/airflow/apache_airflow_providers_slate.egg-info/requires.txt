@@ -1,0 +1,2 @@
+apache-airflow>=2.6
+slate-sdk>=0.2.0
