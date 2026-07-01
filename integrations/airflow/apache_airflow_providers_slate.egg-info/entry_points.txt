@@ -1,2 +1,0 @@
-[apache_airflow_provider]
-slate = apache_airflow_providers_slate

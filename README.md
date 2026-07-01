@@ -2,19 +2,15 @@
 
 **Open-source data orchestrator for AI workloads.**
 
-Move datasets, model weights, and checkpoints between object stores at high throughput. Single binary. No config files. No vendor lock-in.
+Move datasets, model weights, and checkpoints between object stores with job queuing, retry, pipeline chaining, cron scheduling, cost tracking, and a REST API — in a single self-hostable binary.
 
 ```
-Benchmarked: S3 us-east-1 → Hetzner Frankfurt · 5 × 529 MiB model weights (2.6 GiB)
+Benchmarked: S3 us-east-1 → Hetzner Frankfurt · 5 × 529 MiB model weights
 
   slate           984 MB/s   ████████████████████████████████████
   rclone         1120 MB/s   ████████████████████████████████████████  1.14× faster
   aws s3 cp       221 MB/s   ████████                                  4.4× slower
 ```
-
-Slate is within **14% of rclone** and **4.4× faster than `aws s3 cp`** with zero configuration. Slate's differentiation over rclone: a REST API with real-time progress streaming, persistent SQLite job history, and unified multi-cloud support in a single binary — no config files for any provider.
-
-Full benchmark methodology in [bench/](bench/).
 
 ---
 
@@ -27,119 +23,243 @@ curl -fsSL https://github.com/tsushanth/slate/releases/latest/download/slate-lin
   | tar xz -C /usr/local/bin
 ```
 
-**Build from source (requires Rust 1.75+):**
+**Python integrations:**
+
+```bash
+pip install slate-sdk                          # Python client
+pip install apache-airflow-providers-slate     # Airflow operator
+pip install prefect-slate                      # Prefect task
+```
+
+**Build from source (Rust 1.75+):**
 
 ```bash
 git clone https://github.com/tsushanth/slate
-cd slate
-cargo build --release
-# binaries: target/release/slate, target/release/slate-api
+cd slate && cargo build --release
 ```
 
 ---
 
-## Usage
+## Quick start
 
 ```bash
-# Copy a dataset from S3 to GCS
-slate copy s3://my-bucket/datasets/imagenet gs://gcs-bucket/datasets/imagenet
+# Start the API server
+DATABASE_URL=sqlite:slate.db?mode=rwc slate-api
 
-# Copy model weights to local disk
-slate copy s3://my-bucket/weights/llama-3-70b /mnt/nvme/weights/
+# Submit a transfer
+curl -X POST localhost:3030/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"src": "s3://my-bucket/datasets/imagenet", "dst": "gs://other/datasets/imagenet"}'
 
-# Estimate egress cost before transferring
-slate copy --estimate s3://my-bucket/weights gs://gcs-bucket/weights
-
-# List recent jobs
-slate jobs
-
-# Check status of a running job
-slate status <job-id>
+# Or use the CLI (blocking, with progress bar)
+slate copy s3://my-bucket/datasets/imagenet /mnt/nvme/datasets/imagenet
 ```
 
-### Supported stores
+---
+
+## Features
+
+### Job queue with priority
+
+```bash
+curl -X POST localhost:3030/jobs -d '{
+  "src": "s3://bucket/weights",
+  "dst": "gs://other/weights",
+  "priority": 10
+}'
+```
+
+Jobs are queued and picked up by a background worker. Higher priority = picked up first. Configurable concurrency via `SLATE_WORKER_CONCURRENCY` (default 4).
+
+### Retry with exponential backoff
+
+Jobs retry automatically on failure — 30s → 5min → 30min. Configurable per job:
+
+```bash
+curl -X POST localhost:3030/jobs -d '{
+  "src": "s3://bucket/data",
+  "dst": "gs://other/data",
+  "max_attempts": 5
+}'
+```
+
+### Pipeline chaining
+
+```bash
+# Submit job A
+JOB_A=$(curl -s -X POST localhost:3030/jobs \
+  -d '{"src": "s3://raw/", "dst": "gs://stage/"}' | jq -r .id)
+
+# Job B won't start until job A completes
+curl -X POST localhost:3030/jobs -d "{
+  \"src\": \"gs://stage/\",
+  \"dst\": \"gs://prod/\",
+  \"depends_on\": \"$JOB_A\"
+}"
+```
+
+### Cron scheduling
+
+Standard 5-field cron syntax:
+
+```bash
+# Daily at 2am UTC
+curl -X POST localhost:3030/crons -d '{
+  "src": "s3://data-lake/raw/",
+  "dst": "gs://ml-staging/raw/",
+  "cron": "0 2 * * *"
+}'
+
+# Every 6 hours
+curl -X POST localhost:3030/crons -d '{
+  "src": "s3://checkpoints/latest/",
+  "dst": "/mnt/nvme/checkpoints/",
+  "cron": "0 */6 * * *"
+}'
+
+# List / delete schedules
+curl localhost:3030/crons
+curl -X DELETE localhost:3030/crons/<id>
+```
+
+### Webhook callbacks
+
+```bash
+curl -X POST localhost:3030/jobs -d '{
+  "src": "s3://bucket/data",
+  "dst": "gs://other/data",
+  "callback_url": "https://your-service/hooks/slate"
+}'
+# POST fires on completion or terminal failure with job metadata
+```
+
+### Cost tracking
+
+```bash
+curl localhost:3030/cost              # aggregate across all completed jobs
+curl localhost:3030/jobs/<id>/cost    # per-job egress cost estimate
+```
+
+### Cancel queued jobs
+
+```bash
+curl -X POST localhost:3030/jobs/<id>/cancel
+```
+
+### Real-time progress (SSE)
+
+```bash
+curl localhost:3030/jobs/<id>/events
+# data: {"job_id":"...","bytes_transferred":1073741824,"bytes_total":2684354560,"throughput_mbps":512.3}
+```
+
+---
+
+## Airflow integration
+
+```bash
+pip install apache-airflow-providers-slate
+```
+
+```python
+from apache_airflow_providers_slate.operators.slate import SlateTransferOperator
+
+with DAG("ml_pipeline", schedule="@daily") as dag:
+    ingest = SlateTransferOperator(
+        task_id="ingest_dataset",
+        src="s3://raw-data/datasets/imagenet/",
+        dst="gs://ml-staging/datasets/imagenet/",
+    )
+    train = SlateTransferOperator(
+        task_id="copy_weights",
+        src="gs://ml-staging/weights/llama-3/",
+        dst="/mnt/nvme/weights/",
+        priority=10,
+        max_attempts=5,
+    )
+    ingest >> train
+```
+
+Set up an Airflow connection (`slate_default`, type HTTP, host + port 3030). The operator logs progress every poll and returns job metadata via XCom.
+
+---
+
+## Prefect integration
+
+```bash
+pip install prefect-slate
+```
+
+```python
+from prefect import flow
+from prefect_slate import slate_transfer, SlateCredentials
+
+creds = SlateCredentials(base_url="http://slate-api:3030")
+
+@flow
+def ml_pipeline():
+    result = slate_transfer(
+        src="s3://raw/datasets/imagenet/",
+        dst="gs://staging/datasets/imagenet/",
+        slate_credentials=creds,
+    )
+    print(f"Transferred {result['bytes_transferred']} bytes at {result['peak_throughput_mbps']:.0f} MB/s")
+```
+
+---
+
+## API reference
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/healthz` | Health check |
+| `POST` | `/jobs` | Submit a transfer job |
+| `GET` | `/jobs` | List recent jobs |
+| `GET` | `/jobs/:id` | Get job by ID |
+| `POST` | `/jobs/:id/cancel` | Cancel a queued job |
+| `GET` | `/jobs/:id/events` | SSE real-time progress |
+| `GET` | `/jobs/:id/cost` | Egress cost estimate for job |
+| `GET` | `/cost` | Aggregate egress cost |
+| `POST` | `/crons` | Create a recurring schedule |
+| `GET` | `/crons` | List schedules |
+| `GET` | `/crons/:id` | Get schedule by ID |
+| `DELETE` | `/crons/:id` | Delete schedule |
+
+---
+
+## Supported stores
 
 | URL scheme | Provider |
 |---|---|
-| `s3://bucket/prefix` | AWS S3 (+ S3-compatible: MinIO, Cloudflare R2) |
+| `s3://bucket/prefix` | AWS S3 (+ MinIO, Cloudflare R2) |
 | `gs://bucket/prefix` | Google Cloud Storage |
 | `az://container/prefix` | Azure Blob Storage |
 | `/path` or `file:///path` | Local filesystem |
 
-Any combination of source and destination works.
-
 ---
 
-## API server
+## Configuration
 
-For programmatic use or transfers you want to monitor in real time:
+**Transfer tuning:**
 
-```bash
-DATABASE_URL=sqlite:slate.db?mode=rwc slate-api
-# Starts on :3030
-```
-
-```bash
-# Start a transfer
-curl -X POST localhost:3030/jobs \
-  -H 'Content-Type: application/json' \
-  -d '{"src": "s3://bucket/data", "dst": "gs://other-bucket/data"}'
-
-# Stream real-time progress (Server-Sent Events)
-curl localhost:3030/jobs/<id>/events
-
-# List all jobs
-curl localhost:3030/jobs
-
-# Get job by ID
-curl localhost:3030/jobs/<id>
-
-# Health check
-curl localhost:3030/healthz
-```
-
----
-
-## How it works
-
-For each transfer, Slate:
-
-1. **Lists** all objects under the source prefix
-2. **Fans out** up to 16 objects concurrently
-3. For each object, **pre-allocates** the destination file at full size, then issues 4 parallel 64 MiB range-GETs
-4. **Writes** each chunk at its byte offset as it arrives — no buffering the full file in memory
-
-Pre-allocating and writing chunks at their offsets (seekable writes) lets disk I/O and network I/O pipeline concurrently instead of serializing. Peak RAM = `parallel_chunks × chunk_size` = 256 MiB regardless of object size. Larger chunks (64 MiB vs the 8 MiB default of many tools) dramatically reduce per-request overhead at cross-region latencies.
-
-HTTP/2 is negotiated where available with a 32-connection pool and keepalive pings to minimize per-request handshake cost.
-
-All jobs are persisted to SQLite — restarts are safe and history is retained.
-
-### Tuning
-
-All parallelism parameters are runtime-configurable with no config file:
-
-```bash
-SLATE_PARALLEL_OBJECTS=32 \
-SLATE_PARALLEL_CHUNKS=8 \
-SLATE_CHUNK_SIZE_MIB=64 \
-slate copy s3://source gs://dest
-```
-
-| Variable | Default | What it controls |
+| Variable | Default | Description |
 |---|---|---|
 | `SLATE_PARALLEL_OBJECTS` | 16 | Objects transferred concurrently |
-| `SLATE_PARALLEL_CHUNKS` | 4 | Range-GETs in flight per object |
-| `SLATE_CHUNK_SIZE_MIB` | 64 | Chunk size — larger = fewer requests = less RTT overhead |
-| `SLATE_STRATEGY` | `chunked` | `chunked` (seekable range-GETs, default) or `stream` (full-object streaming) |
+| `SLATE_PARALLEL_CHUNKS` | 4 | Range-GETs per object |
+| `SLATE_CHUNK_SIZE_MIB` | 64 | Chunk size (larger = fewer requests at cross-region latency) |
+| `SLATE_STRATEGY` | `chunked` | `chunked` or `stream` |
 
----
+**Worker:**
 
-## Credentials
+| Variable | Default | Description |
+|---|---|---|
+| `SLATE_WORKER_CONCURRENCY` | 4 | Max concurrent transfers |
+| `DATABASE_URL` | `sqlite:slate.db?mode=rwc` | Job store |
+| `LISTEN_ADDR` | `0.0.0.0:3030` | API bind address |
 
-Standard environment variables — no config file needed:
+**Credentials** — standard provider env vars, no config file needed:
 
-- **AWS / S3-compatible**: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`
+- **AWS**: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`
 - **GCS**: `GOOGLE_SERVICE_ACCOUNT` or `GOOGLE_APPLICATION_CREDENTIALS`
 - **Azure**: `AZURE_STORAGE_ACCOUNT_NAME`, `AZURE_STORAGE_ACCESS_KEY`
 
@@ -147,24 +267,24 @@ Standard environment variables — no config file needed:
 
 ## Architecture
 
-Rust workspace with four crates:
+Rust workspace:
 
 | Crate | Role |
 |---|---|
-| `slate-core` | Transfer engine: seekable parallel range-GETs, object-level fan-out |
-| `slate-store` | SQLite job store via sqlx |
-| `slate-api` | axum REST API with SSE progress streaming |
-| `slate-cli` | clap CLI with indicatif progress bar |
+| `slate-core` | Transfer engine, job model, cost estimation |
+| `slate-store` | SQLite job store + cron store |
+| `slate-api` | axum REST API + background worker + cron scheduler |
+| `slate-cli` | CLI with progress bar |
 
-Built on [object_store](https://crates.io/crates/object_store) (Apache Arrow project) for a unified abstraction over S3, GCS, and Azure Blob.
+Built on [object_store](https://crates.io/crates/object_store) (Apache Arrow) for unified S3/GCS/Azure support.
 
 ---
 
 ## What's next
 
-- **Resumable transfers** — SQLite job store already tracks progress; need retry-from-offset
-- **Adaptive parallelism** — auto-tune chunk size and concurrency based on observed RTT
-- **Web dashboard** — API + SSE stream is in place; need a UI
-- **macOS / Windows binaries** — currently Linux x86_64 only
+- **Postgres** — multi-node deployments and team/org scoping
+- **Resumable transfers** — retry-from-offset using SQLite progress tracking
+- **Adaptive parallelism** — auto-tune based on observed RTT
+- **Web dashboard** — job history, cost charts, schedule management
 
-PRs welcome. Open an issue if you hit a bug or want to discuss a feature.
+PRs welcome.

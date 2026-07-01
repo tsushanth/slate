@@ -5,3 +5,7 @@ slate.db-wal
 bench/results-*.md
 *.pem
 .env
+# Python build artifacts
+integrations/**/dist/
+integrations/**/*.egg-info/
+integrations/**/__pycache__/

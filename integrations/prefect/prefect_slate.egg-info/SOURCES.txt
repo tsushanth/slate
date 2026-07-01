@@ -1,9 +1,0 @@
-README.md
-pyproject.toml
-prefect_slate/__init__.py
-prefect_slate/tasks.py
-prefect_slate.egg-info/PKG-INFO
-prefect_slate.egg-info/SOURCES.txt
-prefect_slate.egg-info/dependency_links.txt
-prefect_slate.egg-info/requires.txt
-prefect_slate.egg-info/top_level.txt
